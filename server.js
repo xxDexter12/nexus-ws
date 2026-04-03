@@ -147,13 +147,3 @@ app.ws('/ws', (ws, req) => {
 app.listen(PORT, () => {
   console.log('Listening on port', PORT);
 });
-      console.log(String(data).slice(0, 2000));
-    }
-    console.log('='.repeat(62) + '\n');
-  });
-  ws.on('close', () => console.log('[ws] closed'));
-});
-
-app.listen(PORT, () => {
-  console.log('Listening on port', PORT);
-});
